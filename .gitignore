@@ -1,0 +1,23 @@
+# Virtual Environment
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Download temp files
+.*.temp/
+.download_states/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Gemini
+.gemini/
