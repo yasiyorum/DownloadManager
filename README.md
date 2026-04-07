@@ -1,79 +1,73 @@
-# ⚡ Aggressive Multi-Connection Download Manager
+# ⚡ Agresif İndirme Yöneticisi v3.0
 
-Python tabanlı, **CustomTkinter** GUI'li, **asyncio + aiohttp** motorlu agresif çoklu bağlantılı indirme yöneticisi.
+Python tabanlı, çoklu bağlantılı, saf ve güvenilir profesyonel indirme yöneticisi.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## ✨ Özellikler
 
-- **Agresif Chunking**: HTTP Range başlıkları ile dosyayı 2 MB'lık mikro-chunk'lara böler
-- **Worker Pool**: 1-64 arası eşzamanlı bağlantı — bant genişliğini maksimum kullanır
-- **Stabil Hız**: EMA (Exponential Moving Average) ile yumuşatılmış hız gösterimi
-- **Kalıcı Devam (Persistent Resume)**: Uygulama kapansa, bilgisayar kapansa bile kaldığı yerden devam eder
-- **Otomatik Retry**: Başarısız chunk'lar için üstel geri çekilme (exponential backoff) ile 8 deneme
-- **Modern GUI**: CustomTkinter ile koyu temalı, profesyonel arayüz
-- **Kısmi Chunk Resume**: Yarım kalan chunk'ları kaldığı byte'tan sürdürür
-- **Tahmini Kalan Süre**: ETA gösterimi ile ne kadar sürede biteceğini görün
+### ⬇ İndirme Motoru
+- **Agresif Chunking** — 2 MB mikro-chunk'lar, 1-64 eşzamanlı bağlantı
+- **Worker Pool** — Boşalan worker yeni iş alır, bant genişliğini maksimum kullanır
+- **Kalıcı Devam** — Uygulama/bilgisayar kapansa bile kaldığı yerden devam
+- **Otomatik Retry** — Exponential backoff ile 8 deneme
+- **EMA Hız Gösterimi** — Stabil, dalgalanmasız hız bilgisi
+- **🚀 Hız Sınırlama** — İstenilen hızda indirme (KB/s) limiti koyabilme
 
-## 📸 Ekran Görüntüsü
+### 📋 Kuyruk & Zamanlama
+- **Sıralı İndirme Kuyruğu** — Birden fazla indirmeyi otomatik olarak sıraya dizer
+- **🔗 Toplu İndirme** — URL listesi veya `.txt` metin dosyasından toplu indirme
+- **⏰ Zamanlı İndirme** — Belirlenen saatte otomatik başlatma (SS:DD formatı)
 
-*Uygulama koyu temalı modern arayüz ile çalışır.*
+### 📦 Post-İndirme
+- **📦 Otomatik Arşiv Açma** — ZIP, TAR, GZ, BZ2 otomatik çıkarma
+- **🗂️ Dosya Kategorilendirme** — Video, Müzik, Belge vb. türüne göre klasörlere otomatik ayırma
+- **📊 İndirme Geçmişi** — SQLite tabanlı arama yapılabilir, silinebilir kalıcı geçmiş
+
+### 🎬 Medya ve Torrent İndirici
+- **🎬 Video İndirme (yt-dlp)** — YouTube ve diğer sitelerden video indirme (python kütüphanesi olarak doğrudan uygulamaya gömülüdür, exe işlemlerini sıkıntıya sokmaz).
+- **🌐 Torrent Desteği** — `magnet:?` linklerini ve `.torrent` dosyalarını otomatik algılar ve dahili modül ile indirir.
+
+### 🖥 Uygulama
+- **System Tray** — Arka planda çalışma, tray ikonundan kontrol
+- **🔔 Bildirimler** — Windows toast bildirimleri (indirme tamamlandığında uyarır)
+- **🔄 Otomatik Başlangıç** — Windows startup entegrasyonu
+- **Modern GUI** — CustomTkinter ile koyu temalı, sade ve profesyonel arayüz
 
 ## 🚀 Kurulum
 
 ```bash
-# Repo'yu klonla
-git clone https://github.com/yasiyorum/aggressive-download-manager.git
-cd aggressive-download-manager
-
-# Sanal ortam oluştur ve bağımlılıkları kur
+git clone https://github.com/yasiyorum/DownloadManager.git
+cd DownloadManager
 python -m venv venv
-
-# Windows
-.\venv\Scripts\activate
-
-# Linux/Mac
-source venv/bin/activate
-
+.\venv\Scripts\activate         # Windows
 pip install -r requirements.txt
+python main.py                    # Başlat
 ```
-
-## ▶️ Kullanım
-
-```bash
-python main.py
-```
-
-1. URL kutusuna indirme bağlantısını yapıştırın
-2. Bağlantı sayısı slider'ından agresiflik seviyesini ayarlayın (1-64)
-3. **İNDİR** butonuna basın
-4. İndirme sırasında **Duraklat** / **Devam** yapabilirsiniz
-5. Uygulamayı kapatsanız bile bir sonraki açılışta kaldığı yerden devam eder
 
 ## 🏗️ Mimari
 
 ```
-├── main.py              # Giriş noktası
-├── download_engine.py   # Asenkron indirme motoru
-├── gui.py               # CustomTkinter GUI
-└── requirements.txt     # Bağımlılıklar
+├── main.py                    # Giriş
+├── download_engine.py         # Asenkron HTTP indirme motoru
+├── gui.py                     # GUI arayüzü, indirme kuyruğu ve tray modülü
+├── features.py                # Kategoriler, arşiv çıkartıcı, bildirimler, torrent ve ytdlp motoru
+├── dialogs.py                 # Ayarlar, geçmiş ve diğer tüm alt pencereler
+└── requirements.txt           # Bağımlılıklar
 ```
-
-### İndirme Motoru
-
-- **Worker Pool**: `asyncio.Queue` + N worker → boşalan worker yeni chunk alır
-- **Mikro-Chunk**: 2 MB parçalar → yavaş chunk diğerlerini bloklamaz
-- **Persistent State**: `.state.json` ile durum kalıcı olarak kaydedilir
-- **Asenkron I/O**: `aiofiles` ile disk yazma event loop'u bloklamaz
 
 ## 📋 Bağımlılıklar
 
 | Paket | Açıklama |
 |---|---|
-| `aiohttp` | Asenkron HTTP istemci |
-| `aiofiles` | Asenkron dosya I/O |
-| `customtkinter` | Modern Tkinter GUI |
+| `aiohttp` | Asenkron HTTP istemci arayüzü |
+| `aiofiles` | Asenkron dosya okuma/yazma |
+| `customtkinter` | Modern Tkinter GUI motoru |
+| `Pillow` | Arayüz/tepsi ikon oluşturucusu |
+| `pystray` | System tray (bildirim çubuğu simgesi) |
+| `yt-dlp` | Natively embedded video indirme kütüphanesi |
+| `torrentp` | Torrent & Magnet link yöneticisi |
 
 ## 📄 Lisans
 

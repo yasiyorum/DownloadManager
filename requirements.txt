@@ -1,3 +1,7 @@
 aiohttp>=3.9
 aiofiles>=23.2
 customtkinter>=5.2
+Pillow>=10.0
+pystray>=0.19
+yt-dlp>=2024.0.0
+torrentp>=0.2.6

@@ -125,6 +125,10 @@ class DownloadEngine:
         self.on_complete = None       # (output_path)
         self.on_error = None          # (error_text)
 
+        # Hız sınırlama
+        self.speed_limit = 0          # bytes/s, 0 = sınırsız
+        self._num_workers = 1
+
         # İç durum
         self._chunks: list[ChunkInfo] = []
         self._downloaded_total = 0
@@ -224,6 +228,7 @@ class DownloadEngine:
                     # "ab" modu: var olan verinin sonuna ekle
                     mode = "ab" if existing_bytes > 0 else "wb"
                     async with aiofiles.open(part_path, mode) as f:
+                        chunk_start = time.time()
                         async for data in resp.content.iter_chunked(CHUNK_READ_SIZE):
                             await self._pause_event.wait()
                             if self.is_cancelled:
@@ -233,6 +238,14 @@ class DownloadEngine:
                             chunk.downloaded += len(data)
                             self._downloaded_total += len(data)
                             self._notify_chunk(chunk)
+
+                            # Hız sınırlama
+                            if self.speed_limit > 0:
+                                per_worker = self.speed_limit / max(self._num_workers, 1)
+                                elapsed = time.time() - chunk_start
+                                expected = chunk.downloaded / per_worker
+                                if expected > elapsed:
+                                    await asyncio.sleep(expected - elapsed)
 
                 if chunk.downloaded >= chunk.size * 0.99:
                     chunk.status = ChunkInfo.COMPLETED
@@ -503,6 +516,8 @@ class DownloadEngine:
                     force_close=False,
                     ttl_dns_cache=300,
                 )
+
+                self._num_workers = min(connections, len(pending_chunks))
 
                 queue = asyncio.Queue()
                 for c in pending_chunks:

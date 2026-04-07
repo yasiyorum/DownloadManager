@@ -1,5 +1,5 @@
 """
-Agresif Çoklu Bağlantılı İndirme Yöneticisi
+Agresif Çoklu Bağlantılı İndirme Yöneticisi v3
 Ana giriş noktası — GUI'yi başlatır.
 """
 

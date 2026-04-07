@@ -19,5 +19,10 @@ __pycache__/
 Thumbs.db
 .DS_Store
 
+# PyInstaller
+build/
+dist/
+*.spec
+
 # Gemini
 .gemini/
