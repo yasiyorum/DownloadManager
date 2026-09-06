@@ -49,8 +49,9 @@ def _dialog_base(parent, title, w, h):
 
 # ═══════════════════ Ayarlar Dialogu ═══════════════════
 class SettingsDialog:
-    def __init__(self, parent, settings: SettingsManager):
+    def __init__(self, parent, settings: SettingsManager, on_save=None):
         self.settings = settings
+        self.on_save = on_save
         d = _dialog_base(parent, "⚙  Ayarlar", 520, 560)
         self.dialog = d
 
@@ -156,18 +157,21 @@ class SettingsDialog:
             AutoStart.disable()
         self.settings.set("auto_start", self.autostart_var.get())
         self.dialog.destroy()
+        if self.on_save:
+            self.on_save()
 
 
 # ═══════════════════ Geçmiş Dialogu ═══════════════════
 class HistoryDialog:
     def __init__(self, parent, history: DownloadHistory):
         self.history = history
-        d = _dialog_base(parent, "📊  İndirme Geçmişi", 700, 500)
+        d = _dialog_base(parent, "📊  İndirme Geçmişi", 760, 520)
+        self.dialog = d
 
         # Arama
         top = ctk.CTkFrame(d, fg_color="transparent")
         top.pack(fill="x", padx=16, pady=(16, 8))
-        self.search_entry = ctk.CTkEntry(top, placeholder_text="Ara...",
+        self.search_entry = ctk.CTkEntry(top, placeholder_text="Dosya veya URL ara...",
                                           fg_color=BG_INPUT, border_color=BORDER, text_color=TXT)
         self.search_entry.pack(side="left", fill="x", expand=True)
         ctk.CTkButton(top, text="🔍", width=40, fg_color=ACCENT, hover_color=ACCENT_H,
@@ -189,19 +193,68 @@ class HistoryDialog:
             ctk.CTkLabel(self.scroll, text="Geçmiş boş", font=(FONT, 12),
                          text_color=TXT3).pack(pady=20)
             return
+
         for i, item in enumerate(items):
-            row = ctk.CTkFrame(self.scroll, fg_color=BG_CARD, corner_radius=8, height=40)
-            row.grid(row=i, column=0, sticky="ew", pady=2)
+            row = ctk.CTkFrame(self.scroll, fg_color=BG_CARD, corner_radius=8, height=44)
+            row.grid(row=i, column=0, sticky="ew", pady=3)
             row.grid_columnconfigure(1, weight=1)
+
             st = "✅" if item["status"] == "completed" else "❌"
             ctk.CTkLabel(row, text=st, width=28).grid(row=0, column=0, padx=(8, 2))
-            ctk.CTkLabel(row, text=item.get("filename", "?"), font=(FONT, 12),
-                         text_color=TXT, anchor="w").grid(row=0, column=1, sticky="ew", padx=4)
+
+            fn = item.get("filename", "?")
+            f_path = item.get("path", "")
+            lbl = ctk.CTkLabel(row, text=fn, font=(FONT, 12, "bold"), text_color=TXT, anchor="w")
+            lbl.grid(row=0, column=1, sticky="ew", padx=4)
+
             size = DownloadEngine._format_size(item.get("size", 0)) if item.get("size") else "-"
-            ctk.CTkLabel(row, text=size, font=(FONT, 11), text_color=TXT3,
-                         width=70).grid(row=0, column=2, padx=4)
-            ctk.CTkLabel(row, text=item.get("date", ""), font=(FONT, 10),
-                         text_color=TXT3, width=110).grid(row=0, column=3, padx=(4, 8))
+            ctk.CTkLabel(row, text=size, font=(FONT, 11), text_color=TXT3, width=70).grid(row=0, column=2, padx=4)
+
+            ctk.CTkLabel(row, text=item.get("date", ""), font=(FONT, 10), text_color=TXT3, width=105).grid(row=0, column=3, padx=4)
+
+            # Aksiyon butonları (Klasörde göster / Aç / Sil)
+            act_f = ctk.CTkFrame(row, fg_color="transparent")
+            act_f.grid(row=0, column=4, padx=(4, 8), pady=2)
+
+            ctk.CTkButton(act_f, text="📁", width=28, height=28, font=(FONT, 11),
+                           fg_color=BG_INPUT, hover_color=ACCENT, text_color=TXT,
+                           command=lambda p=f_path: self._show_in_folder(p)).pack(side="left", padx=2)
+
+            ctk.CTkButton(act_f, text="▶", width=28, height=28, font=(FONT, 11),
+                           fg_color=BG_INPUT, hover_color=GREEN, text_color=TXT,
+                           command=lambda p=f_path: self._open_file(p)).pack(side="left", padx=2)
+
+            ctk.CTkButton(act_f, text="✖", width=24, height=28, font=(FONT, 11),
+                           fg_color="transparent", hover_color=RED, text_color=TXT3,
+                           command=lambda rid=item["id"]: self._delete_one(rid)).pack(side="left", padx=2)
+
+    def _open_file(self, path):
+        if path and os.path.exists(path):
+            try:
+                os.startfile(path)
+            except Exception as e:
+                messagebox.showerror("Hata", f"Dosya açılamadı: {e}")
+        else:
+            messagebox.showwarning("Bulunamadı", "Dosya bu konumda bulunamadı veya silinmiş.")
+
+    def _show_in_folder(self, path):
+        import subprocess
+        if path and os.path.exists(path):
+            try:
+                subprocess.run(["explorer", f"/select,{os.path.normpath(path)}"])
+            except Exception:
+                try:
+                    os.startfile(os.path.dirname(path))
+                except Exception:
+                    pass
+        elif path and os.path.isdir(os.path.dirname(path)):
+            os.startfile(os.path.dirname(path))
+        else:
+            messagebox.showwarning("Bulunamadı", "Dosya veya klasör bulunamadı.")
+
+    def _delete_one(self, rid):
+        self.history.delete(rid)
+        self._search()
 
     def _search(self):
         q = self.search_entry.get().strip()
@@ -221,7 +274,7 @@ class BatchDialog:
         d = _dialog_base(parent, "📋  Toplu İndirme", 550, 420)
         self.dialog = d
 
-        ctk.CTkLabel(d, text="Her satıra bir URL yazın:", font=(FONT, 13),
+        ctk.CTkLabel(d, text="Her satıra bir URL veya magnet linki yazın:", font=(FONT, 13),
                      text_color=TXT2).pack(padx=16, pady=(16, 8), anchor="w")
 
         self.textbox = ctk.CTkTextbox(d, fg_color=BG_INPUT, text_color=TXT,
@@ -229,7 +282,7 @@ class BatchDialog:
                                        font=(FONT, 12))
         self.textbox.pack(fill="both", expand=True, padx=16)
 
-        ctk.CTkLabel(d, text="Veya bir metin dosyası seçin:", font=(FONT, 11),
+        ctk.CTkLabel(d, text="Veya bir metin (.txt) dosyası seçin:", font=(FONT, 11),
                      text_color=TXT3).pack(padx=16, pady=(8, 4), anchor="w")
 
         btn_row = ctk.CTkFrame(d, fg_color="transparent")
@@ -251,9 +304,12 @@ class BatchDialog:
 
     def _add_all(self):
         text = self.textbox.get("1.0", "end").strip()
-        urls = [u.strip() for u in text.splitlines() if u.strip() and u.strip().startswith("http")]
+        urls = [
+            u.strip() for u in text.splitlines()
+            if u.strip() and u.strip().startswith(("http://", "https://", "magnet:?", "ftp://"))
+        ]
         if not urls:
-            messagebox.showwarning("Uyarı", "Geçerli URL bulunamadı.")
+            messagebox.showwarning("Uyarı", "Geçerli URL veya magnet linki bulunamadı.")
             return
         for url in urls:
             self.on_add(url)

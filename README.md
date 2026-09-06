@@ -8,32 +8,35 @@ Python tabanlı, çoklu bağlantılı, saf ve güvenilir profesyonel indirme yö
 ## ✨ Özellikler
 
 ### ⬇ İndirme Motoru
-- **Agresif Chunking** — 2 MB mikro-chunk'lar, 1-64 eşzamanlı bağlantı
-- **Worker Pool** — Boşalan worker yeni iş alır, bant genişliğini maksimum kullanır
-- **Kalıcı Devam** — Uygulama/bilgisayar kapansa bile kaldığı yerden devam
+- **Worker Pool Bağlantı Yuvaları** — IDM tarzı gerçek zamanlı `#01..#16` bağlantı yuvası görselleştirmesi (CPU/Bellek dostu)
+- **Agresif Chunking** — 4 MB mikro-chunk'lar, 1-64 eşzamanlı bağlantı
+- **Akıllı Range Tespiti & Fallback** — Cloudflare, Drive veya MediaFire gibi HEAD engelleyen sunuculara karşı GET (Range: 0-1) koruması ve tekil akış desteği
+- **Kalıcı Devam (Persistent State)** — `.download_states` ile uygulama/bilgisayar kapansa bile byte seviyesinde kaldığı yerden devam
+- **Hızlı Birleştirme (Instant Merge)** — Tek parçalı indirmelerde sıfır disk I/O ile anında dosya tamamlama
 - **Otomatik Retry** — Exponential backoff ile 8 deneme
 - **EMA Hız Gösterimi** — Stabil, dalgalanmasız hız bilgisi
 - **🚀 Hız Sınırlama** — İstenilen hızda indirme (KB/s) limiti koyabilme
+- **Güvenli Dosya Adlandırma** — Windows rezerve kelimeleri (`CON`, `PRN`, `AUX`, vb.) ve geçersiz karakterleri (`<>:"/\|?*`) otomatik temizleme
 
 ### 📋 Kuyruk & Zamanlama
-- **Sıralı İndirme Kuyruğu** — Birden fazla indirmeyi otomatik olarak sıraya dizer
-- **🔗 Toplu İndirme** — URL listesi veya `.txt` metin dosyasından toplu indirme
-- **⏰ Zamanlı İndirme** — Belirlenen saatte otomatik başlatma (SS:DD formatı)
+- **Sıralı İndirme Kuyruğu** — Birden fazla indirmeyi otomatik olarak sıraya dizer, "▶ Başlat" ve "🗑 Temizle" kontrolleri
+- **🔗 Toplu İndirme** — URL listesi veya `.txt` metin dosyasından toplu indirme (HTTP, HTTPS, Magnet, FTP)
+- **⏰ Kalıcı Zamanlı İndirme** — Belirlenen saatte otomatik başlatma (uygulama kapansa bile `~/.agresif_dm/schedules.json` ile korunur)
 
 ### 📦 Post-İndirme
-- **📦 Otomatik Arşiv Açma** — ZIP, TAR, GZ, BZ2 otomatik çıkarma
-- **🗂️ Dosya Kategorilendirme** — Video, Müzik, Belge vb. türüne göre klasörlere otomatik ayırma
-- **📊 İndirme Geçmişi** — SQLite tabanlı arama yapılabilir, silinebilir kalıcı geçmiş
+- **📦 Otomatik Arşiv Açma** — ZIP, TAR, GZ, BZ2 otomatik çıkarma (klasör korumalı, veri kaybını önler)
+- **🗂️ Dosya Kategorilendirme** — Video, Müzik, Belge vb. türüne göre klasörlere güvenli otomatik ayırma
+- **📊 İndirme Geçmişi** — SQLite tabanlı, doğrudan dosya açma ("▶") ve klasörde seçerek gösterme ("📁") butonlu arama yapılabilir geçmiş
 
 ### 🎬 Medya ve Torrent İndirici
-- **🎬 Video İndirme (yt-dlp)** — YouTube ve diğer sitelerden video indirme (python kütüphanesi olarak doğrudan uygulamaya gömülüdür, exe işlemlerini sıkıntıya sokmaz).
-- **🌐 Torrent Desteği** — `magnet:?` linklerini ve `.torrent` dosyalarını otomatik algılar ve dahili modül ile indirir.
+- **🎬 Video İndirme (yt-dlp)** — YouTube ve diğer sitelerden video indirme; canlı hız, kalan süre ve gerçek dosya adı yakalama
+- **🌐 Torrent Desteği** — `magnet:?` linklerini ve `.torrent` dosyalarını asenkron olay döngüsü, canlı eş (peer) ve durum monitörü ile eksiksiz indirme
 
 ### 🖥 Uygulama
-- **System Tray** — Arka planda çalışma, tray ikonundan kontrol
-- **🔔 Bildirimler** — Windows toast bildirimleri (indirme tamamlandığında uyarır)
-- **🔄 Otomatik Başlangıç** — Windows startup entegrasyonu
-- **Modern GUI** — CustomTkinter ile koyu temalı, sade ve profesyonel arayüz
+- **System Tray** — Arka planda çalışma, tray ikonundan bildirim ve kontrol
+- **🔔 Bildirimler** — Windows toast bildirimleri (indirme tamamlandığında sesli ve görsel uyarır)
+- **🔄 Otomatik Başlangıç** — Windows startup (Registry) entegrasyonu
+- **Modern GUI** — CustomTkinter ile koyu temalı, 60 FPS akıcı ve profesyonel arayüz
 
 ## 🚀 Kurulum
 

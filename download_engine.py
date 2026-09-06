@@ -1,10 +1,13 @@
 """
-Aggressive Multi-Connection Download Engine v2
+Aggressive Multi-Connection Download Engine v3
 ───────────────────────────────────────────────
-• Worker-pool modeli: 2 MB'lık mikro-chunk'lar, boşalan worker yeni iş alır
+• Worker-pool modeli: mikro-chunk'lar, boşalan worker yeni iş alır
 • Persistent state: .state.json ile uygulama/bilgisayar kapansa bile devam
 • EMA hız yumuşatma: 5 saniyelik pencere ile stabil hız gösterimi
 • Kısmi chunk resume: yarım kalan chunk kaldığı byte'tan devam eder
+• Akıllı Fallback: HEAD reddedilirse GET (Range: 0-1) ile boyut/range tespiti
+• Güvenli Dosya Adı: Windows rezerve ve geçersiz karakterleri temizleme
+• Hızlı Birleştirme: Tek parçalı indirmelerde anında taşıma
 """
 
 import asyncio
@@ -13,20 +16,49 @@ import os
 import re
 import shutil
 import time
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 import aiohttp
 import aiofiles
 
 # ───────────────────────── Sabitler ─────────────────────────
 MAX_RETRIES = 8
-CHUNK_READ_SIZE = 131072          # 128 KB ağ okuma buffer
-MERGE_BUFFER_SIZE = 16 * 1024 * 1024  # 8 MB birleştirme buffer
-MICRO_CHUNK_SIZE = 4 * 1024 * 1024   # 2 MB mikro-chunk boyutu
+CHUNK_READ_SIZE = 131072               # 128 KB ağ okuma buffer
+MERGE_BUFFER_SIZE = 16 * 1024 * 1024   # 16 MB birleştirme buffer
+MICRO_CHUNK_SIZE = 4 * 1024 * 1024     # 4 MB mikro-chunk boyutu
 CONNECT_TIMEOUT = 30
 READ_TIMEOUT = 120
-EMA_ALPHA = 0.3                   # hız yumuşatma katsayısı (0-1, küçük = daha düz)
-STATE_SAVE_INTERVAL = 2.0         # saniye — state dosyası yazma aralığı
+EMA_ALPHA = 0.3                        # Hız yumuşatma katsayısı
+STATE_SAVE_INTERVAL = 2.0              # Saniye — state dosyası yazma aralığı
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/134.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "Connection": "keep-alive",
+}
+
+
+def sanitize_filename(name: str) -> str:
+    """Windows ve Linux için dosya adını güvenli hale getirir."""
+    if not name:
+        return f"download_{int(time.time())}"
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+    name = name.strip(". ")
+    reserved = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+                "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+                "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
+    base, ext = os.path.splitext(name)
+    if base.upper() in reserved:
+        name = f"_{name}"
+    if not name or name == "_":
+        name = f"download_{int(time.time())}"
+    return name
+
 
 
 class ChunkInfo:
@@ -115,12 +147,13 @@ class DownloadEngine:
     def __init__(self):
         self.is_cancelled = False
         self.is_paused = False
-        self._pause_event = asyncio.Event()
-        self._pause_event.set()
+        self._pause_event = None  # Lazy init in start()
+        self._completed = False   # Reliable completion flag
 
         # Callback'ler — GUI tarafından atanır
         self.on_progress = None       # (downloaded_total, total_size, speed_bps)
         self.on_chunk_update = None   # (chunk_idx, status_str, downloaded, size)
+        self.on_worker_update = None  # (worker_id, chunk_idx, downloaded, size, status, speed)
         self.on_status = None         # (status_text)
         self.on_complete = None       # (output_path)
         self.on_error = None          # (error_text)
@@ -138,44 +171,116 @@ class DownloadEngine:
         self._last_bytes = 0
         self._last_time = 0.0
         self._state: DownloadState | None = None
+        self._state_meta: dict | None = None
         self._state_dirty = False
+        self._active_tasks: list[asyncio.Task] = []
+        self._session: aiohttp.ClientSession | None = None
 
     # ─────────────────── Dosya Bilgisi ───────────────────
     async def fetch_file_info(self, url: str) -> dict:
-        timeout = aiohttp.ClientTimeout(total=CONNECT_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.head(url, allow_redirects=True) as resp:
-                resp.raise_for_status()
-                headers = resp.headers
-                content_length = int(headers.get("Content-Length", 0))
-                accept_ranges = headers.get("Accept-Ranges", "none").lower()
-                supports_range = accept_ranges == "bytes" and content_length > 0
-                filename = self._extract_filename(headers, url)
-                return {
-                    "size": content_length,
-                    "supports_range": supports_range,
-                    "filename": filename,
-                    "url": str(resp.url),
-                }
+        """
+        Dosya boyutunu, range desteğini ve adını tespit eder.
+        HEAD reddedilirse GET (Range: 0-1) fallback uygular.
+        """
+        timeout = aiohttp.ClientTimeout(total=CONNECT_TIMEOUT, connect=15)
+        connector = aiohttp.TCPConnector(ssl=False)
+
+        # 1. HEAD isteği dene
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=DEFAULT_HEADERS) as session:
+                async with session.head(url, allow_redirects=True) as resp:
+                    headers = resp.headers
+                    final_url = str(resp.url)
+                    content_length = int(headers.get("Content-Length", 0))
+                    accept_ranges = headers.get("Accept-Ranges", "none").lower()
+                    supports_range = (accept_ranges == "bytes" or "bytes" in accept_ranges) and content_length > 0
+                    filename = self._extract_filename(headers, final_url)
+
+                    if resp.status in (200, 206) and content_length > 0:
+                        return {
+                            "size": content_length,
+                            "supports_range": supports_range,
+                            "filename": filename,
+                            "url": final_url,
+                        }
+        except Exception:
+            pass
+
+        # 2. GET (Range: 0-1) fallback (Cloudflare/Google Drive gibi HEAD engelleyenler için)
+        try:
+            range_headers = {**DEFAULT_HEADERS, "Range": "bytes=0-1"}
+            connector2 = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector2, headers=range_headers) as session:
+                async with session.get(url, allow_redirects=True) as resp:
+                    headers = resp.headers
+                    final_url = str(resp.url)
+                    filename = self._extract_filename(headers, final_url)
+
+                    if resp.status == 206:
+                        cr = headers.get("Content-Range", "")
+                        match = re.search(r"/(\d+)$", cr)
+                        total = int(match.group(1)) if match else int(headers.get("Content-Length", 0))
+                        return {
+                            "size": total,
+                            "supports_range": True,
+                            "filename": filename,
+                            "url": final_url,
+                        }
+                    elif resp.status == 200:
+                        total = int(headers.get("Content-Length", 0))
+                        return {
+                            "size": total,
+                            "supports_range": False,
+                            "filename": filename,
+                            "url": final_url,
+                        }
+        except Exception:
+            pass
+
+        return {
+            "size": 0,
+            "supports_range": False,
+            "filename": self._extract_filename({}, url),
+            "url": url,
+        }
 
     @staticmethod
     def _extract_filename(headers, url: str) -> str:
-        cd = headers.get("Content-Disposition", "")
+        """RFC uyumlu dosya adı çıkarma ve URL parametre analizi."""
+        # 1. Content-Disposition
+        cd = headers.get("Content-Disposition", "") if headers else ""
         if cd:
-            match = re.search(
-                r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\r\n]+)',
-                cd, re.IGNORECASE
-            )
-            if match:
-                return unquote(match.group(1).strip())
-        path = urlparse(url).path
+            m_utf8 = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\r\n]+)", cd, re.IGNORECASE)
+            if m_utf8:
+                return sanitize_filename(unquote(m_utf8.group(1).strip().strip('"\'')))
+            m = re.search(r'filename\s*=\s*"?([^";\r\n]+)"?', cd, re.IGNORECASE)
+            if m:
+                return sanitize_filename(unquote(m.group(1).strip().strip('"\'')))
+
+        # 2. URL Query Parametreleri
+        parsed = urlparse(url)
+        if parsed.query:
+            qs = parse_qs(parsed.query)
+            for k in ("file", "filename", "name", "dl_file", "response-content-disposition"):
+                if k in qs and qs[k]:
+                    val = qs[k][0]
+                    if "." in val:
+                        return sanitize_filename(unquote(val))
+
+        # 3. URL Yolu
+        path = unquote(parsed.path)
         name = os.path.basename(path)
-        return unquote(name) if name else "download"
+        if name:
+            return sanitize_filename(name)
+
+        return f"download_{int(time.time())}"
 
     # ──────────────── Mikro-Chunk Hesaplama ────────────────
     @staticmethod
     def calculate_micro_chunks(total_size: int) -> list[tuple[int, int]]:
-        """Dosyayı 2 MB'lık mikro-chunk'lara böler."""
+        """Dosyayı mikro-chunk'lara böler."""
+        if total_size <= 0:
+            return []
         chunks = []
         offset = 0
         while offset < total_size:
@@ -191,10 +296,16 @@ class DownloadEngine:
         url: str,
         chunk: ChunkInfo,
         temp_dir: str,
+        worker_id: int = 0,
     ) -> bool:
         part_path = os.path.join(temp_dir, f"{chunk.idx:06d}.part")
 
         for attempt in range(1, MAX_RETRIES + 1):
+            if self.is_cancelled:
+                return False
+
+            if self._pause_event:
+                await self._pause_event.wait()
             if self.is_cancelled:
                 return False
 
@@ -204,20 +315,21 @@ class DownloadEngine:
             existing_bytes = 0
             if os.path.exists(part_path):
                 existing_bytes = os.path.getsize(part_path)
-                if existing_bytes >= chunk.size:
-                    # Zaten tamamlanmış
+                if existing_bytes >= chunk.size and chunk.size > 0:
                     chunk.downloaded = chunk.size
                     chunk.status = ChunkInfo.COMPLETED
                     self._notify_chunk(chunk)
+                    self._notify_worker(worker_id, chunk.idx, chunk.size, chunk.size, "completed")
                     return True
 
             actual_start = chunk.start + existing_bytes
             chunk.downloaded = existing_bytes
             chunk.status = ChunkInfo.DOWNLOADING if attempt == 1 else ChunkInfo.RETRYING
             self._notify_chunk(chunk)
+            self._notify_worker(worker_id, chunk.idx, existing_bytes, chunk.size, chunk.status)
 
             try:
-                headers = {"Range": f"bytes={actual_start}-{chunk.end}"}
+                headers = {**DEFAULT_HEADERS, "Range": f"bytes={actual_start}-{chunk.end}"}
                 async with session.get(url, headers=headers) as resp:
                     if resp.status not in (200, 206):
                         raise aiohttp.ClientResponseError(
@@ -225,19 +337,31 @@ class DownloadEngine:
                             status=resp.status, message=f"HTTP {resp.status}"
                         )
 
-                    # "ab" modu: var olan verinin sonuna ekle
-                    mode = "ab" if existing_bytes > 0 else "wb"
+                    mode = "ab" if (existing_bytes > 0 and resp.status == 206) else "wb"
+                    if resp.status == 200 and actual_start > 0:
+                        chunk.downloaded = 0
+                        mode = "wb"
+
                     async with aiofiles.open(part_path, mode) as f:
                         chunk_start = time.time()
+                        last_notify = time.time()
+
                         async for data in resp.content.iter_chunked(CHUNK_READ_SIZE):
-                            await self._pause_event.wait()
+                            if self._pause_event:
+                                await self._pause_event.wait()
                             if self.is_cancelled:
                                 return False
 
                             await f.write(data)
-                            chunk.downloaded += len(data)
-                            self._downloaded_total += len(data)
-                            self._notify_chunk(chunk)
+                            d_len = len(data)
+                            chunk.downloaded += d_len
+                            self._downloaded_total += d_len
+
+                            now = time.time()
+                            if now - last_notify > 0.15:
+                                self._notify_chunk(chunk)
+                                self._notify_worker(worker_id, chunk.idx, chunk.downloaded, chunk.size, "downloading")
+                                last_notify = now
 
                             # Hız sınırlama
                             if self.speed_limit > 0:
@@ -251,6 +375,7 @@ class DownloadEngine:
                     chunk.status = ChunkInfo.COMPLETED
                     chunk.downloaded = chunk.size
                     self._notify_chunk(chunk)
+                    self._notify_worker(worker_id, chunk.idx, chunk.size, chunk.size, "completed")
                     self._state_dirty = True
                     return True
                 else:
@@ -262,12 +387,16 @@ class DownloadEngine:
             except asyncio.CancelledError:
                 return False
             except Exception:
-                backoff = min(2 ** attempt, 30)
+                if self.is_cancelled:
+                    return False
+                backoff = min(2 ** attempt, 15)
+                self._notify_worker(worker_id, chunk.idx, chunk.downloaded, chunk.size, "retrying")
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(backoff)
 
         chunk.status = ChunkInfo.FAILED
         self._notify_chunk(chunk)
+        self._notify_worker(worker_id, chunk.idx, chunk.downloaded, chunk.size, "failed")
         return False
 
     # ──────────────── Worker Pool ────────────────
@@ -279,19 +408,94 @@ class DownloadEngine:
             try:
                 chunk: ChunkInfo = queue.get_nowait()
             except asyncio.QueueEmpty:
+                self._notify_worker(worker_id, None, 0, 0, "idle")
                 break
 
-            ok = await self._download_chunk(session, url, chunk, temp_dir)
+            ok = await self._download_chunk(session, url, chunk, temp_dir, worker_id=worker_id)
             results[chunk.idx] = ok
             queue.task_done()
 
+    # ──────────────── Tek Akış İndirme (Range Desteksiz / Bilinmeyen Boyut) ────────────────
+    async def _download_single_stream(self, url: str, output_path: str) -> bool:
+        """Range desteklemeyen veya boyutu belirsiz dosyalar için kesintisiz akış."""
+        timeout = aiohttp.ClientTimeout(connect=CONNECT_TIMEOUT, sock_read=READ_TIMEOUT, total=None)
+        connector = aiohttp.TCPConnector(ssl=False)
+        self._num_workers = 1
+        self._notify_worker(0, 0, 0, self._total_size, "downloading")
+
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=DEFAULT_HEADERS) as session:
+            self._session = session
+            progress_task = asyncio.create_task(self._progress_loop())
+            self._active_tasks.append(progress_task)
+
+            try:
+                async with session.get(url) as resp:
+                    resp.raise_for_status()
+                    async with aiofiles.open(output_path, "wb") as f:
+                        last_notify = time.time()
+                        chunk_start = time.time()
+
+                        async for data in resp.content.iter_chunked(CHUNK_READ_SIZE):
+                            if self._pause_event:
+                                await self._pause_event.wait()
+                            if self.is_cancelled:
+                                return False
+
+                            await f.write(data)
+                            d_len = len(data)
+                            self._downloaded_total += d_len
+
+                            now = time.time()
+                            if now - last_notify > 0.2:
+                                self._notify_worker(0, 0, self._downloaded_total, self._total_size, "downloading")
+                                last_notify = now
+
+                            if self.speed_limit > 0:
+                                elapsed = time.time() - chunk_start
+                                expected = self._downloaded_total / self.speed_limit
+                                if expected > elapsed:
+                                    await asyncio.sleep(expected - elapsed)
+
+                self._completed = True
+                self._notify_worker(0, 0, self._downloaded_total, self._total_size or self._downloaded_total, "completed")
+                return True
+            except asyncio.CancelledError:
+                return False
+            finally:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
     # ──────────────── Birleştirme ────────────────
     async def merge_chunks(self, temp_dir: str, output_path: str, chunks: list[ChunkInfo]):
+        """Tamamlanan chunk'ları birleştirir. Tek parça ise anında taşır."""
+        valid_chunks = [c for c in chunks if c.status == ChunkInfo.COMPLETED]
+        if not valid_chunks:
+            return
+
+        # 1. Tek parça ise anında taşı (Sıfır ek disk okuma/yazma)
+        if len(valid_chunks) == 1:
+            part_path = os.path.join(temp_dir, f"{valid_chunks[0].idx:06d}.part")
+            if os.path.exists(part_path):
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                shutil.move(part_path, output_path)
+                return
+
+        # 2. Çoklu parçaları birleştir
         if self.on_status:
             self.on_status("Parçalar birleştiriliyor...")
 
+        total_bytes = sum(c.size for c in valid_chunks)
+        merged_bytes = 0
+
         async with aiofiles.open(output_path, "wb") as out_f:
-            for chunk in sorted(chunks, key=lambda c: c.idx):
+            for chunk in sorted(valid_chunks, key=lambda c: c.idx):
                 part_path = os.path.join(temp_dir, f"{chunk.idx:06d}.part")
                 if not os.path.exists(part_path):
                     continue
@@ -301,6 +505,10 @@ class DownloadEngine:
                         if not buf:
                             break
                         await out_f.write(buf)
+                        merged_bytes += len(buf)
+                        if total_bytes > 0 and self.on_status:
+                            pct = (merged_bytes / total_bytes) * 100
+                            self.on_status(f"Parçalar birleştiriliyor: %{pct:.0f}...")
 
     # ──────────────── Hız Hesaplama (EMA) ────────────────
     def _calc_speed(self) -> float:
@@ -327,6 +535,10 @@ class DownloadEngine:
         if self.on_chunk_update:
             self.on_chunk_update(chunk.idx, chunk.status, chunk.downloaded, chunk.size)
 
+    def _notify_worker(self, worker_id: int, chunk_idx: int | None, downloaded: int, size: int, status: str):
+        if self.on_worker_update:
+            self.on_worker_update(worker_id, chunk_idx, downloaded, size, status)
+
     async def _progress_loop(self):
         """Periyodik ilerleme + state kaydetme."""
         last_state_save = 0.0
@@ -346,13 +558,17 @@ class DownloadEngine:
 
     def _save_state(self):
         """Mevcut durumu diske yazar."""
-        if self._state and hasattr(self, "_state_meta"):
+        if self._completed or not self._state or not hasattr(self, "_state_meta") or not self._state_meta:
+            return
+        try:
             m = self._state_meta
             self._state.save(
                 m["url"], m["filename"], m["total_size"],
                 m["connections"], m["temp_dir"], m["output_path"],
                 self._chunks,
             )
+        except Exception:
+            pass
 
     # ──────────────── Yarıda Kalan İndirmeleri Bul ────────────────
     @staticmethod
@@ -391,12 +607,15 @@ class DownloadEngine:
         """
         self.is_cancelled = False
         self.is_paused = False
+        self._completed = False
+        self._pause_event = asyncio.Event()
         self._pause_event.set()
         self._downloaded_total = 0
         self._ema_speed = 0.0
         self._last_bytes = 0
         self._last_time = time.time()
         self._start_time = time.time()
+        self._active_tasks.clear()
 
         try:
             if resume_state:
@@ -448,16 +667,34 @@ class DownloadEngine:
                 real_url = info["url"]
                 self._total_size = info["size"]
                 filename = info["filename"]
+                supports_range = info["supports_range"]
 
-                if not info["supports_range"] or info["size"] == 0:
-                    connections = 1
+                # Dosya adı çakışmasını önle
+                output_path = os.path.join(save_dir, filename)
+                if os.path.exists(output_path):
+                    base_n, ext_n = os.path.splitext(filename)
+                    counter = 1
+                    while os.path.exists(os.path.join(save_dir, f"{base_n} ({counter}){ext_n}")):
+                        counter += 1
+                    filename = f"{base_n} ({counter}){ext_n}"
+                    output_path = os.path.join(save_dir, filename)
 
                 if self.on_status:
-                    self.on_status(
-                        f"Dosya: {filename} — {self._format_size(info['size'])}"
-                    )
+                    size_str = self._format_size(self._total_size) if self._total_size > 0 else "Bilinmiyor"
+                    self.on_status(f"Dosya: {filename} — {size_str}")
 
-                output_path = os.path.join(save_dir, filename)
+                # Range desteklenmiyorsa veya boyut 0 ise: Tek Akış İndirme
+                if not supports_range or self._total_size <= 0:
+                    ok = await self._download_single_stream(real_url, output_path)
+                    if ok:
+                        elapsed = time.time() - self._start_time
+                        avg_spd = self._downloaded_total / elapsed if elapsed > 0 else 0
+                        if self.on_complete:
+                            self.on_complete(output_path)
+                        if self.on_status:
+                            self.on_status(f"✅ Tamamlandı — {self._format_size(self._downloaded_total)} ({self._format_time(elapsed)})")
+                    return
+
                 temp_dir = os.path.join(save_dir, f".{filename}.temp")
                 os.makedirs(temp_dir, exist_ok=True)
 
@@ -468,11 +705,7 @@ class DownloadEngine:
                 state_path = os.path.join(state_dir, f"{safe_name}.state.json")
                 self._state = DownloadState(state_path)
 
-                if connections == 1 or not info["supports_range"]:
-                    ranges = [(0, info["size"] - 1)]
-                else:
-                    ranges = self.calculate_micro_chunks(info["size"])
-
+                ranges = self.calculate_micro_chunks(self._total_size)
                 self._chunks = [ChunkInfo(i, s, e) for i, (s, e) in enumerate(ranges)]
                 pending_chunks = list(self._chunks)
 
@@ -515,6 +748,7 @@ class DownloadEngine:
                     enable_cleanup_closed=True,
                     force_close=False,
                     ttl_dns_cache=300,
+                    ssl=False,
                 )
 
                 self._num_workers = min(connections, len(pending_chunks))
@@ -525,16 +759,19 @@ class DownloadEngine:
 
                 results: dict[int, bool] = {}
                 progress_task = asyncio.create_task(self._progress_loop())
+                self._active_tasks.append(progress_task)
 
                 async with aiohttp.ClientSession(
-                    timeout=timeout, connector=connector
+                    timeout=timeout, connector=connector, headers=DEFAULT_HEADERS
                 ) as session:
+                    self._session = session
                     workers = [
                         asyncio.create_task(
                             self._worker(i, queue, session, real_url, temp_dir, results)
                         )
-                        for i in range(min(connections, len(pending_chunks)))
+                        for i in range(self._num_workers)
                     ]
+                    self._active_tasks.extend(workers)
                     await asyncio.gather(*workers, return_exceptions=True)
 
                 progress_task.cancel()
@@ -569,10 +806,15 @@ class DownloadEngine:
             self._cleanup(temp_dir)
             if self._state:
                 self._state.delete()
+                # Eğer .download_states boşsa klasörü de sil
+                state_dir = os.path.dirname(self._state.path)
+                self._cleanup_empty_dir(state_dir)
+                self._state = None
 
             elapsed = time.time() - self._start_time
             avg_speed = self._total_size / elapsed if elapsed > 0 else 0
 
+            self._completed = True
             if self.on_progress:
                 self.on_progress(self._total_size, self._total_size, avg_speed)
             if self.on_status:
@@ -584,11 +826,13 @@ class DownloadEngine:
                 self.on_complete(output_path)
 
         except asyncio.CancelledError:
-            self._save_state()
+            if not self._completed:
+                self._save_state()
             if self.on_status:
                 self.on_status("İndirme duraklatıldı.")
         except Exception as e:
-            self._save_state()
+            if not self._completed:
+                self._save_state()
             if self.on_error:
                 self.on_error(str(e))
 
@@ -596,16 +840,22 @@ class DownloadEngine:
     def cancel(self):
         """İndirmeyi durdurur ve durumu kaydeder — devam edilebilir."""
         self.is_cancelled = True
-        self._pause_event.set()
+        if self._pause_event:
+            self._pause_event.set()
+        for t in self._active_tasks:
+            if not t.done():
+                t.cancel()
         self._save_state()
 
     def pause(self):
         self.is_paused = True
-        self._pause_event.clear()
+        if self._pause_event:
+            self._pause_event.clear()
 
     def resume(self):
         self.is_paused = False
-        self._pause_event.set()
+        if self._pause_event:
+            self._pause_event.set()
 
     # ──────────────── Yardımcı Metodlar ────────────────
     @staticmethod
@@ -613,6 +863,15 @@ class DownloadEngine:
         try:
             if os.path.isdir(temp_dir):
                 shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _cleanup_empty_dir(dir_path: str):
+        """Klasör boşsa sil."""
+        try:
+            if os.path.isdir(dir_path) and not os.listdir(dir_path):
+                os.rmdir(dir_path)
         except OSError:
             pass
 

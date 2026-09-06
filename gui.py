@@ -16,11 +16,12 @@ from download_engine import DownloadEngine
 from features import (
     SettingsManager, DownloadHistory, FileCategorizer,
     AutoExtractor, Notifications, DownloadScheduler,
-    TorrentDownloader,
+    TorrentDownloader, ClipboardWatcher, VideoDownloader,
+    BrowserDownloadWatcher,
 )
 from dialogs import (
     SettingsDialog, HistoryDialog, BatchDialog,
-    VideoDialog, ScheduleDialog,
+    ScheduleDialog,
 )
 
 try:
@@ -41,35 +42,58 @@ TEXT_PRIMARY = "#e6edf3"; TEXT_SECONDARY = "#8b949e"; TEXT_DIM = "#484f58"
 FONT_FAMILY = "Segoe UI"
 
 
-class ChunkRow(ctk.CTkFrame):
-    STATUS_COLORS = {"pending": TEXT_DIM, "downloading": ACCENT,
-                     "completed": GREEN, "failed": RED, "retrying": ORANGE}
-    STATUS_LABELS = {"pending": "Bekliyor", "downloading": "İndiriliyor",
-                     "completed": "Tamamlandı", "failed": "Başarısız", "retrying": "Yeniden..."}
+class WorkerRow(ctk.CTkFrame):
+    STATUS_COLORS = {
+        "idle": TEXT_DIM,
+        "downloading": ACCENT,
+        "completed": GREEN,
+        "failed": RED,
+        "retrying": ORANGE,
+    }
+    STATUS_LABELS = {
+        "idle": "Boşta",
+        "downloading": "İndiriliyor",
+        "completed": "Tamamlandı",
+        "failed": "Başarısız",
+        "retrying": "Yeniden...",
+    }
 
-    def __init__(self, master, idx, size, **kw):
+    def __init__(self, master, worker_id, **kw):
         super().__init__(master, fg_color="transparent", height=28, **kw)
         self.grid_columnconfigure(1, weight=1)
-        self.idx_label = ctk.CTkLabel(self, text=f"#{idx+1:03d}", font=(FONT_FAMILY, 11),
-                                       text_color=TEXT_SECONDARY, width=50, anchor="w")
+        self.worker_id = worker_id
+        self.idx_label = ctk.CTkLabel(
+            self, text=f"Bağlantı #{worker_id+1:02d}",
+            font=(FONT_FAMILY, 11, "bold"), text_color=TEXT_SECONDARY,
+            width=85, anchor="w"
+        )
         self.idx_label.grid(row=0, column=0, padx=(8, 4), pady=1)
-        self.progress = ctk.CTkProgressBar(self, height=8, corner_radius=4,
-                                            fg_color=BG_INPUT, progress_color=ACCENT)
+
+        self.progress = ctk.CTkProgressBar(
+            self, height=8, corner_radius=4, fg_color=BG_INPUT, progress_color=ACCENT
+        )
         self.progress.grid(row=0, column=1, sticky="ew", padx=4, pady=1)
         self.progress.set(0)
-        self.status_label = ctk.CTkLabel(self, text="Bekliyor", font=(FONT_FAMILY, 11),
-                                          text_color=TEXT_DIM, width=90, anchor="e")
+
+        self.status_label = ctk.CTkLabel(
+            self, text="Boşta", font=(FONT_FAMILY, 10),
+            text_color=TEXT_DIM, width=105, anchor="e"
+        )
         self.status_label.grid(row=0, column=2, padx=(4, 8), pady=1)
 
-    def update_status(self, status, downloaded, size):
+    def update_worker(self, chunk_idx, downloaded, size, status, speed=0.0):
         color = self.STATUS_COLORS.get(status, TEXT_DIM)
-        label = self.STATUS_LABELS.get(status, status)
         pct = downloaded / size if size > 0 else 0
         self.progress.set(min(pct, 1.0))
-        pc = {GREEN: "completed", RED: "failed", ORANGE: "retrying"}.get(
-            self.STATUS_COLORS.get(status), None)
-        self.progress.configure(progress_color=self.STATUS_COLORS.get(status, ACCENT))
-        self.status_label.configure(text=label, text_color=color)
+        self.progress.configure(progress_color=color)
+
+        if status == "downloading":
+            ch_str = f"P#{chunk_idx+1}" if chunk_idx is not None else ""
+            txt = f"{ch_str} (%{pct*100:.0f})" if ch_str else f"%{pct*100:.0f}"
+        else:
+            txt = self.STATUS_LABELS.get(status, status)
+
+        self.status_label.configure(text=txt, text_color=color)
 
 
 class QueueItemRow(ctk.CTkFrame):
@@ -111,16 +135,28 @@ class DownloadManagerApp(ctk.CTk):
         self.scheduler.on_trigger = self._on_scheduled_trigger
         self.engine = DownloadEngine()
         self._loop = None; self._thread = None
-        self._download_running = False; self._chunk_rows = []
+        self._download_running = False; self._worker_rows = []
+        self._total_chunks = 0; self._completed_chunks = 0
         self._pending_resume = None; self._current_queue_item = None
         self._save_dir = self.settings.get("save_dir")
         self._download_queue = []
         self._tray_icon = None
+        self._clipboard = ClipboardWatcher()
+        self._clipboard.on_url_detected = self._on_clipboard_url
+        self._clipboard_popup = None  # Active popup reference
+        self._browser_watcher = BrowserDownloadWatcher()
+        self._browser_watcher.on_download_detected = self._on_browser_download
+        self._browser_popup = None
 
         self._build_ui()
         if HAS_TRAY: self._setup_tray()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(500, self._check_pending_downloads)
+        # Pending download check in background to avoid startup lag
+        self.after(300, lambda: threading.Thread(target=self._check_pending_downloads_bg, daemon=True).start())
+        # Start clipboard monitoring
+        self.after(1000, lambda: self._clipboard.start(self))
+        # Start browser download watching
+        self.after(2000, lambda: self._browser_watcher.start(self))
 
     def _build_ui(self):
         self.grid_rowconfigure(5, weight=1)
@@ -142,11 +178,11 @@ class DownloadManagerApp(ctk.CTk):
         toolbar.grid_propagate(False)
         tbtns = [
             ("📊 Geçmiş", self._show_history), ("📋 Toplu", self._show_batch),
-            ("🎬 Video", self._show_video), ("⏰ Zamanlı", self._show_schedule),
+            ("⏰ Zamanlı", self._show_schedule),
             ("⚙ Ayarlar", self._show_settings),
         ]
         for i, (txt, cmd) in enumerate(tbtns):
-            ctk.CTkButton(toolbar, text=txt, width=100, height=32, font=(FONT_FAMILY, 11),
+            ctk.CTkButton(toolbar, text=txt, width=110, height=32, font=(FONT_FAMILY, 11),
                            fg_color="transparent", hover_color=ACCENT, text_color=TEXT_SECONDARY,
                            command=cmd).pack(side="left", padx=2, pady=5)
 
@@ -217,11 +253,20 @@ class DownloadManagerApp(ctk.CTk):
         queue_card.grid_columnconfigure(0, weight=1)
         qh = ctk.CTkFrame(queue_card, fg_color="transparent")
         qh.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 4))
-        qh.grid_columnconfigure(1, weight=1)
+        qh.grid_columnconfigure(0, weight=1)
+
         ctk.CTkLabel(qh, text="📋 İndirme Kuyruğu", font=(FONT_FAMILY, 13, "bold"),
                      text_color=TEXT_PRIMARY).grid(row=0, column=0, sticky="w")
-        self.queue_count_label = ctk.CTkLabel(qh, text="Boş", font=(FONT_FAMILY, 11), text_color=TEXT_DIM)
-        self.queue_count_label.grid(row=0, column=1, sticky="e")
+
+        q_acts = ctk.CTkFrame(qh, fg_color="transparent")
+        q_acts.grid(row=0, column=1, sticky="e")
+        self.queue_count_label = ctk.CTkLabel(q_acts, text="Boş", font=(FONT_FAMILY, 11), text_color=TEXT_DIM)
+        self.queue_count_label.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(q_acts, text="▶ Başlat", width=60, height=24, font=(FONT_FAMILY, 10, "bold"),
+                      fg_color=GREEN, hover_color="#3fb950", command=self._process_queue).pack(side="left", padx=2)
+        ctk.CTkButton(q_acts, text="🗑 Temizle", width=60, height=24, font=(FONT_FAMILY, 10),
+                      fg_color=BG_INPUT, hover_color=RED, command=self._clear_queue).pack(side="left", padx=2)
+
         self.queue_scroll = ctk.CTkScrollableFrame(queue_card, fg_color=BG_DARK, corner_radius=8,
                                                     height=60, scrollbar_button_color=BORDER_COLOR,
                                                     scrollbar_button_hover_color=TEXT_DIM)
@@ -272,7 +317,7 @@ class DownloadManagerApp(ctk.CTk):
 
     # ═══════════════ Toolbar Actions ═══════════════
     def _show_settings(self):
-        SettingsDialog(self, self.settings)
+        SettingsDialog(self, self.settings, on_save=self._apply_settings)
         self._apply_settings()
 
     def _show_history(self):
@@ -281,13 +326,194 @@ class DownloadManagerApp(ctk.CTk):
     def _show_batch(self):
         BatchDialog(self, self._add_url_to_queue)
 
-    def _show_video(self):
-        VideoDialog(self, self._save_dir)
-
     def _show_schedule(self):
         ScheduleDialog(self, self.scheduler)
 
+    # ═══════════════ Clipboard Link Yakalama ═══════════════
+    def _on_clipboard_url(self, url, is_video):
+        """Clipboard'da indirilebilir URL algılandığında çağrılır."""
+        if self._download_running:
+            return
+        if self.state() == "iconic" or not self.winfo_viewable():
+            type_txt = "Video linki" if is_video else "İndirme linki"
+            Notifications.show("⚡ Link Algılandı", f"{type_txt}: {url[:45]}...")
+        if self._clipboard_popup and self._clipboard_popup.winfo_exists():
+            return
+        self._show_clipboard_popup(url, is_video)
 
+    def _show_clipboard_popup(self, url, is_video):
+        """Clipboard'dan yakalanan URL için floating popup göster."""
+        # Eski popup varsa kapat
+        if self._clipboard_popup and self._clipboard_popup.winfo_exists():
+            self._clipboard_popup.destroy()
+
+        popup = ctk.CTkFrame(self, fg_color="#1c2128", corner_radius=12,
+                              border_width=1, border_color=ACCENT)
+        popup.place(relx=0.5, rely=0.0, anchor="n", y=62)
+        popup.lift()
+        self._clipboard_popup = popup
+
+        # İçerik
+        inner = ctk.CTkFrame(popup, fg_color="transparent")
+        inner.pack(padx=12, pady=10)
+
+        icon = "🎬" if is_video else "🔗"
+        type_text = "Video linki" if is_video else "İndirme linki"
+
+        ctk.CTkLabel(inner, text=f"{icon} {type_text} algılandı!",
+                     font=(FONT_FAMILY, 13, "bold"), text_color=TEXT_PRIMARY
+                     ).pack(anchor="w")
+
+        # URL göster (kısa)
+        short_url = url[:60] + "..." if len(url) > 60 else url
+        ctk.CTkLabel(inner, text=short_url, font=(FONT_FAMILY, 10),
+                     text_color=TEXT_DIM).pack(anchor="w", pady=(2, 6))
+
+        btn_row = ctk.CTkFrame(inner, fg_color="transparent")
+        btn_row.pack(fill="x")
+
+        ctk.CTkButton(btn_row, text="⬇ İndir", width=90, height=30,
+                       font=(FONT_FAMILY, 11, "bold"), fg_color=ACCENT,
+                       hover_color=ACCENT_HOVER,
+                       command=lambda: self._accept_clipboard(url, popup)
+                       ).pack(side="left", padx=(0, 4))
+
+        ctk.CTkButton(btn_row, text="📋 Kuyruğa", width=90, height=30,
+                       font=(FONT_FAMILY, 11), fg_color=GREEN,
+                       hover_color="#3fb950",
+                       command=lambda: self._queue_clipboard(url, popup)
+                       ).pack(side="left", padx=4)
+
+        ctk.CTkButton(btn_row, text="✖", width=30, height=30,
+                       font=(FONT_FAMILY, 12), fg_color="transparent",
+                       hover_color=RED, text_color=TEXT_DIM,
+                       command=lambda: popup.destroy()
+                       ).pack(side="right")
+
+        # 8 saniye sonra otomatik kapat
+        self.after(8000, lambda: popup.destroy() if popup.winfo_exists() else None)
+
+    def _accept_clipboard(self, url, popup):
+        """Clipboard URL'sini hemen indir."""
+        popup.destroy()
+        self.url_entry.configure(state="normal")
+        self.url_entry.delete(0, "end")
+        self.url_entry.insert(0, url)
+        self._start_download()
+
+    def _queue_clipboard(self, url, popup):
+        """Clipboard URL'sini kuyruğa ekle."""
+        popup.destroy()
+        self._add_url_to_queue(url)
+
+    # ═══════════════ Tarayıcı İndirme Yakalama ═══════════════
+    def _on_browser_download(self, url, filename, crdownload_path):
+        """Tarayıcıda yeni indirme algılandığında çağrılır."""
+        if self._download_running:
+            return
+        if self.state() == "iconic" or not self.winfo_viewable():
+            Notifications.show("⚡ Tarayıcı İndirmesi", f"{filename} algılandı!")
+            self._tray_show()
+        if self._browser_popup and self._browser_popup.winfo_exists():
+            return
+        # Clipboard popup varsa onu kapat
+        if self._clipboard_popup and self._clipboard_popup.winfo_exists():
+            self._clipboard_popup.destroy()
+        self._show_browser_popup(url, filename, crdownload_path)
+
+    def _show_browser_popup(self, url, filename, crdownload_path):
+        """Tarayıcıdan yakalanan indirme için popup göster."""
+        if self._browser_popup and self._browser_popup.winfo_exists():
+            self._browser_popup.destroy()
+
+        browser = self._browser_watcher.browser_name
+
+        popup = ctk.CTkFrame(self, fg_color="#1c2128", corner_radius=12,
+                              border_width=2, border_color=GREEN)
+        popup.place(relx=0.5, rely=0.0, anchor="n", y=62)
+        popup.lift()
+        self._browser_popup = popup
+
+        inner = ctk.CTkFrame(popup, fg_color="transparent")
+        inner.pack(padx=14, pady=12)
+
+        ctk.CTkLabel(inner, text=f"\U0001F310 {browser}'da indirme alg\u0131land\u0131!",
+                     font=(FONT_FAMILY, 14, "bold"), text_color=GREEN
+                     ).pack(anchor="w")
+
+        # Dosya adı
+        display_name = filename if len(filename) <= 50 else filename[:47] + "..."
+        ctk.CTkLabel(inner, text=f"\U0001F4C4 {display_name}",
+                     font=(FONT_FAMILY, 12), text_color=TEXT_PRIMARY
+                     ).pack(anchor="w", pady=(4, 0))
+
+        # URL (kısa)
+        short_url = url[:55] + "..." if len(url) > 55 else url
+        ctk.CTkLabel(inner, text=short_url, font=(FONT_FAMILY, 9),
+                     text_color=TEXT_DIM).pack(anchor="w", pady=(2, 8))
+
+        btn_row = ctk.CTkFrame(inner, fg_color="transparent")
+        btn_row.pack(fill="x")
+
+        ctk.CTkButton(btn_row, text="\u26a1 Devral ve \u0130ndir", width=140, height=32,
+                       font=(FONT_FAMILY, 12, "bold"), fg_color=GREEN,
+                       hover_color="#3fb950",
+                       command=lambda: self._accept_browser_download(url, filename, crdownload_path, popup)
+                       ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(btn_row, text="\U0001F4CB Kuyru\u011fa", width=90, height=32,
+                       font=(FONT_FAMILY, 11), fg_color=ACCENT,
+                       hover_color=ACCENT_HOVER,
+                       command=lambda: self._queue_browser_download(url, crdownload_path, popup)
+                       ).pack(side="left", padx=4)
+
+        ctk.CTkButton(btn_row, text="\u2716", width=32, height=32,
+                       font=(FONT_FAMILY, 13), fg_color="transparent",
+                       hover_color=RED, text_color=TEXT_DIM,
+                       command=lambda: popup.destroy()
+                       ).pack(side="right")
+
+        # 12 saniye sonra otomatik kapat
+        self.after(12000, lambda: popup.destroy() if popup.winfo_exists() else None)
+
+    def _accept_browser_download(self, url, filename, crdownload_path, popup):
+        """Tarayıcı indirmesini devral: .crdownload sil, kendi motorumuzla indir."""
+        popup.destroy()
+        # Chrome'un indirmesini iptal et (.crdownload dosyasını sil)
+        self._cancel_browser_download(crdownload_path)
+        # Clipboard'a da işaretle
+        self._clipboard.mark_url_seen(url)
+        self._browser_watcher.mark_url_seen(url)
+        # URL'yi gir ve indir
+        self.url_entry.configure(state="normal")
+        self.url_entry.delete(0, "end")
+        self.url_entry.insert(0, url)
+        self._start_download()
+
+    def _queue_browser_download(self, url, crdownload_path, popup):
+        """Tarayıcı indirmesini kuyruğa ekle."""
+        popup.destroy()
+        self._cancel_browser_download(crdownload_path)
+        self._clipboard.mark_url_seen(url)
+        self._browser_watcher.mark_url_seen(url)
+        self._add_url_to_queue(url)
+
+    def _cancel_browser_download(self, crdownload_path):
+        """Chrome/Edge'in .crdownload dosyasını silerek indirmesini iptal et."""
+        try:
+            if crdownload_path and os.path.exists(crdownload_path):
+                # Biraz bekle — Chrome dosyayı henüz kilitli tutabilir
+                import time
+                for _ in range(5):
+                    try:
+                        os.remove(crdownload_path)
+                        return
+                    except PermissionError:
+                        time.sleep(0.3)
+                # Son deneme
+                os.remove(crdownload_path)
+        except OSError:
+            pass
 
     def _apply_settings(self):
         self._save_dir = self.settings.get("save_dir")
@@ -324,6 +550,10 @@ class DownloadManagerApp(ctk.CTk):
 
     def _remove_from_queue(self, item_id):
         self._download_queue = [q for q in self._download_queue if q["id"] != item_id]
+        self._refresh_queue_ui()
+
+    def _clear_queue(self):
+        self._download_queue = [q for q in self._download_queue if q["status"] == "downloading"]
         self._refresh_queue_ui()
 
     def _process_queue(self):
@@ -367,6 +597,8 @@ class DownloadManagerApp(ctk.CTk):
         else: self._force_quit()
 
     def _force_quit(self):
+        self._clipboard.stop()
+        self._browser_watcher.stop()
         if self._download_running and self.engine:
             self.engine.cancel()
             if self._thread and self._thread.is_alive(): self._thread.join(timeout=3)
@@ -374,10 +606,17 @@ class DownloadManagerApp(ctk.CTk):
         self.destroy()
 
     # ═══════════════ Pending Downloads ═══════════════
-    def _check_pending_downloads(self):
-        pending = DownloadEngine.find_pending_downloads(self._save_dir)
-        if not pending: return
-        latest = max(pending, key=lambda p: p["data"].get("timestamp", 0))
+    def _check_pending_downloads_bg(self):
+        """Background thread: scan for pending downloads, then prompt on main thread."""
+        try:
+            pending = DownloadEngine.find_pending_downloads(self._save_dir)
+            if pending:
+                latest = max(pending, key=lambda p: p["data"].get("timestamp", 0))
+                self.after(0, lambda: self._prompt_resume(latest))
+        except Exception:
+            pass
+
+    def _prompt_resume(self, latest):
         data = latest["data"]; fn = data["filename"]
         dl = latest["downloaded_bytes"]; total = data["total_size"]
         pct = (dl / total * 100) if total > 0 else 0
@@ -409,8 +648,12 @@ class DownloadManagerApp(ctk.CTk):
         connections = int(self.conn_slider.get())
         self._download_running = True; self._current_queue_item = queue_item
         self._set_ui_state(downloading=True)
+
         for w in self.chunk_scroll.winfo_children(): w.destroy()
-        self._chunk_rows = []; self.main_progress.set(0)
+        self._worker_rows = []
+        self._total_chunks = 0
+        self._completed_chunks = 0
+        self.main_progress.set(0)
         self.main_progress.configure(progress_color=ACCENT)
         self.pct_label.configure(text="0%", text_color=TEXT_PRIMARY)
         self.speed_label.configure(text="— MB/s"); self.eta_label.configure(text="Kalan: --")
@@ -423,15 +666,37 @@ class DownloadManagerApp(ctk.CTk):
         self.engine.speed_limit = self.settings.get("speed_limit", 0)
         self.engine.on_progress = self._cb_progress
         self.engine.on_chunk_update = self._cb_chunk
+        self.engine.on_worker_update = self._cb_worker
         self.engine.on_status = self._cb_status
         self.engine.on_complete = self._cb_complete
         self.engine.on_error = self._cb_error
+
+        # Clipboard'daki URL'yi görüldü olarak işaretle
+        self._clipboard.mark_url_seen(url)
 
         # Torrent kontrol
         if TorrentDownloader.is_magnet_or_torrent(url):
             self._thread = threading.Thread(target=self._run_torrent, args=(url, self._save_dir), daemon=True)
             self._thread.start()
             return
+
+        # Video URL kontrol — otomatik algılama
+        if VideoDownloader.is_video_url(url):
+            if not VideoDownloader.is_available():
+                self.status_label.configure(text="⚠ Video indirmek için yt-dlp gerekli (pip install yt-dlp)", text_color=ORANGE)
+                self._download_running = False
+                self._set_ui_state(downloading=False)
+                return
+            self.status_label.configure(text="🎬 Video algılandı, yt-dlp ile indiriliyor...", text_color=ACCENT)
+            self._thread = threading.Thread(target=self._run_video_download, args=(url, self._save_dir), daemon=True)
+            self._thread.start()
+            return
+
+        # Çoklu bağlantı HTTP: Worker slotlarını oluştur
+        for i in range(connections):
+            r = WorkerRow(self.chunk_scroll, i)
+            r.grid(row=i, column=0, sticky="ew", pady=1)
+            self._worker_rows.append(r)
 
         resume_state = self._pending_resume if resume else None
         self._pending_resume = None
@@ -441,42 +706,126 @@ class DownloadManagerApp(ctk.CTk):
         self._thread.start()
 
     def _run_torrent(self, url, save_dir):
-        def _on_prog(msg):
-            self.after(0, lambda: self.status_label.configure(text=msg, text_color=ACCENT))
-        
-        ok = TorrentDownloader.download(url, save_dir, on_progress=_on_prog)
+        def _on_prog(name, done, total, rate, peers, state):
+            def _u():
+                if total > 0:
+                    p = done / total
+                    self.main_progress.set(min(p, 1.0))
+                    self.pct_label.configure(text=f"{p*100:.1f}%")
+                    self.size_label.configure(text=f"{DownloadEngine._format_size(done)} / {DownloadEngine._format_size(total)}")
+                else:
+                    self.size_label.configure(text=DownloadEngine._format_size(done))
+                if rate > 0:
+                    self.speed_label.configure(text=DownloadEngine._format_speed(rate))
+                    if total > done:
+                        rem = (total - done) / rate
+                        self.eta_label.configure(text=f"Kalan: {DownloadEngine._format_time(rem)}", text_color=ACCENT)
+                self.status_label.configure(
+                    text=f"🌐 Torrent: {state} — {peers} peer ({name[:25]})"[:60],
+                    text_color=ACCENT
+                )
+            self.after(0, _u)
+
+        ok, out_path, name = TorrentDownloader.download(
+            url, save_dir, on_progress=_on_prog,
+            cancel_check=lambda: not self._download_running
+        )
         self._download_running = False
         if ok:
-            self.after(0, lambda: self.status_label.configure(text="✅ Torrent tamamlandı!", text_color=GREEN))
+            self.engine._completed = True
+            real_size = os.path.getsize(out_path) if (out_path and os.path.isfile(out_path)) else 0
             self.engine._state_meta = {
-                "output_path": os.path.join(save_dir, "Torrent Download"),
-                "filename": "Torrent Files",
-                "total_size": 0, "url": url
+                "output_path": out_path or save_dir,
+                "filename": name or "Torrent Download",
+                "total_size": real_size,
+                "url": url,
             }
+            self.after(0, lambda: (
+                self.main_progress.set(1.0),
+                self.main_progress.configure(progress_color=GREEN),
+                self.pct_label.configure(text="100%", text_color=GREEN),
+                self.status_label.configure(text="✅ Torrent tamamlandı!", text_color=GREEN),
+            ))
         else:
-            self.after(0, lambda: self.status_label.configure(text="❌ Torrent hatası!", text_color=RED))
-            self.status_label.configure(text="❌ Torrent başarısız!")
-            pass
+            self.after(0, lambda: (
+                self.main_progress.configure(progress_color=RED),
+                self.status_label.configure(text="❌ Torrent başarısız veya iptal edildi!", text_color=RED),
+            ))
         self.after(0, self._on_download_finished)
 
     def _run_loop(self, url, connections, save_dir, resume_state):
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self.engine.start(url, connections, save_dir, resume_state))
+        try:
+            self._loop.run_until_complete(self.engine.start(url, connections, save_dir, resume_state))
+        except Exception:
+            pass
+        finally:
+            self._download_running = False
+            self.after(0, self._on_download_finished)
+
+    def _run_video_download(self, url, save_dir):
+        """yt-dlp ile video indirme — ana UI'daki progress'e yapılandırılmış entegrasyon."""
+        def _on_prog(dl, tot, spd, eta, fn):
+            def _u():
+                if tot > 0:
+                    p = dl / tot
+                    self.main_progress.set(min(p, 1.0))
+                    self.pct_label.configure(text=f"{p*100:.1f}%")
+                    self.size_label.configure(text=f"{DownloadEngine._format_size(dl)} / {DownloadEngine._format_size(tot)}")
+                if spd > 0:
+                    self.speed_label.configure(text=DownloadEngine._format_speed(spd))
+                if eta > 0:
+                    self.eta_label.configure(text=f"Kalan: {DownloadEngine._format_time(eta)}", text_color=ACCENT)
+                elif tot > 0 and dl >= tot:
+                    self.eta_label.configure(text="Kalan: 0s", text_color=GREEN)
+                if fn:
+                    self.status_label.configure(text=f"🎬 {os.path.basename(fn)}"[:50], text_color=ACCENT)
+            self.after(0, _u)
+
+        def _on_out(msg):
+            self.after(0, lambda m=msg: self.status_label.configure(text=m[:60], text_color=TEXT_SECONDARY))
+
+        ok, out_path, title = VideoDownloader.download(
+            url, save_dir, on_progress=_on_prog, on_output=_on_out,
+            cancel_check=lambda: not self._download_running
+        )
         self._download_running = False
+        if ok:
+            self.engine._completed = True
+            real_size = os.path.getsize(out_path) if (out_path and os.path.isfile(out_path)) else 0
+            self.engine._state_meta = {
+                "output_path": out_path or save_dir,
+                "filename": os.path.basename(out_path) if out_path else (title or "video.mp4"),
+                "total_size": real_size,
+                "url": url,
+            }
+            self.after(0, lambda: (
+                self.main_progress.set(1.0),
+                self.main_progress.configure(progress_color=GREEN),
+                self.pct_label.configure(text="100%", text_color=GREEN),
+                self.status_label.configure(text="✅ Video indirildi!", text_color=GREEN),
+                self.eta_label.configure(text="Kalan: 0s", text_color=GREEN),
+            ))
+        else:
+            self.after(0, lambda: (
+                self.main_progress.configure(progress_color=RED),
+                self.status_label.configure(text="❌ Video indirme başarısız veya iptal edildi!", text_color=RED),
+            ))
         self.after(0, self._on_download_finished)
 
     def _on_download_finished(self):
+        self._download_running = False
         self._set_ui_state(downloading=False)
-        st = self.status_label.cget("text") if self.status_label else ""
-        completed = "✅" in st or "Tamamlandı" in st
+        completed = getattr(self.engine, '_completed', False)
 
         if completed:
             # Post-download işlemleri
-            if hasattr(self.engine, "_state_meta") and self.engine._state_meta:
-                out = self.engine._state_meta.get("output_path", "")
-                fn = self.engine._state_meta.get("filename", "")
-                sz = self.engine._state_meta.get("total_size", 0)
-                url = self.engine._state_meta.get("url", "")
+            meta = getattr(self.engine, '_state_meta', None)
+            if meta:
+                out = meta.get("output_path", "")
+                fn = meta.get("filename", "")
+                sz = meta.get("total_size", 0)
+                url = meta.get("url", "")
 
                 # Geçmişe ekle
                 self.history.add(url, fn, sz, "completed", out)
@@ -511,20 +860,48 @@ class DownloadManagerApp(ctk.CTk):
             self.status_label.configure(text="Duraklatıldı", text_color=ORANGE)
 
     def _cancel_download(self):
-        if not messagebox.askyesno("İptal", "İndirme iptal edilecek. Emin misiniz?"): return
+        if not messagebox.askyesno("İptal", "İndirme iptal edilecek ve dosyalar silinecek. Emin misiniz?"): return
+        # Stop the engine
         self.engine.cancel()
-        if hasattr(self.engine, '_state') and self.engine._state:
-            if hasattr(self.engine, '_state_meta'):
-                td = self.engine._state_meta.get("temp_dir", "")
-                if td and os.path.isdir(td):
-                    import shutil
-                    try: shutil.rmtree(td)
-                    except OSError: pass
-            self.engine._state.delete()
-        self.status_label.configure(text="❌ İptal edildi.", text_color=RED)
+        self._download_running = False
+        
+        # Clean up temp files and state
+        meta = getattr(self.engine, '_state_meta', None)
+        if meta:
+            td = meta.get("temp_dir", "")
+            if td and os.path.isdir(td):
+                import shutil
+                try: shutil.rmtree(td)
+                except OSError: pass
+            # Also delete the output file if partially written
+            op = meta.get("output_path", "")
+            if op and os.path.exists(op):
+                try: os.remove(op)
+                except OSError: pass
+        
+        # Delete state file
+        state = getattr(self.engine, '_state', None)
+        if state:
+            state.delete()
+            # Boş kaldıysa .download_states klasörünü de sil
+            state_dir = os.path.dirname(state.path)
+            if os.path.isdir(state_dir) and not os.listdir(state_dir):
+                try: os.rmdir(state_dir)
+                except OSError: pass
+        
+        # Reset UI
+        self._set_ui_state(downloading=False)
+        self.status_label.configure(text="❌ İptal edildi ve dosyalar silindi.", text_color=RED)
+        self.main_progress.set(0)
+        self.main_progress.configure(progress_color=RED)
+        self.pct_label.configure(text="0%", text_color=RED)
+        self.speed_label.configure(text="— MB/s")
+        self.eta_label.configure(text="Kalan: --")
+        
         if self._current_queue_item:
             self._current_queue_item["status"] = "failed"
             self._current_queue_item = None; self._refresh_queue_ui()
+        self.after(1000, self._process_queue)
 
     # ═══════════════ Callbacks ═══════════════
     def _cb_progress(self, downloaded, total, speed):
@@ -543,13 +920,22 @@ class DownloadManagerApp(ctk.CTk):
             self.speed_label.configure(text=DownloadEngine._format_speed(speed))
         self.after(0, _u)
 
+    def _cb_worker(self, worker_id, chunk_idx, downloaded, size, status, speed=0.0):
+        def _u():
+            if worker_id < len(self._worker_rows):
+                self._worker_rows[worker_id].update_worker(chunk_idx, downloaded, size, status, speed)
+        self.after(0, _u)
+
     def _cb_chunk(self, idx, status, downloaded, size):
         def _u():
-            while len(self._chunk_rows) <= idx:
-                r = ChunkRow(self.chunk_scroll, len(self._chunk_rows), size)
-                r.grid(row=len(self._chunk_rows), column=0, sticky="ew", pady=1)
-                self._chunk_rows.append(r)
-            self._chunk_rows[idx].update_status(status, downloaded, size)
+            if idx + 1 > self._total_chunks:
+                self._total_chunks = idx + 1
+            if status == "completed":
+                self._completed_chunks += 1
+            if self._total_chunks > 0:
+                self.size_label.configure(
+                    text=f"Parçalar: {min(self._completed_chunks, self._total_chunks)} / {self._total_chunks}"
+                )
         self.after(0, _u)
 
     def _cb_status(self, text):
@@ -582,6 +968,8 @@ class DownloadManagerApp(ctk.CTk):
             self.conn_slider.configure(state="normal")
 
     def destroy(self):
+        self._clipboard.stop()
+        self._browser_watcher.stop()
         if self._download_running and self.engine:
             self.engine.cancel()
             if self._thread and self._thread.is_alive(): self._thread.join(timeout=3)
